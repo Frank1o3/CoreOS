@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+# =============================================================================
+# CoreOS Installer
+# Target: Arch-based, X11 + i3, systemd-boot, Secure Boot + TPM2
+# Partition layout: EFI (512M) + swap (user-defined) + root (remainder, ext4)
+# =============================================================================
+
+set -euo pipefail
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[0;33m'
+BLU='\033[0;34m'
+BLD='\033[1m'
+RST='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+info()    { echo -e "${BLU}${BLD}==> ${RST}${BLD}$*${RST}"; }
+success() { echo -e "${GRN}${BLD}==> ${RST}${BLD}$*${RST}"; }
+warn()    { echo -e "${YLW}${BLD}==> WARNING: ${RST}$*"; }
+die()     { echo -e "${RED}${BLD}==> ERROR: ${RST}$*" >&2; exit 1; }
+
+confirm() {
+    local prompt="${1} [y/N] "
+    local reply
+    read -rp "$(echo -e ${YLW}${prompt}${RST})" reply
+    [[ "${reply,,}" == "y" ]]
+}
+
+ask() {
+    local prompt="$1"
+    local var="$2"
+    local default="${3:-}"
+    local reply
+    if [[ -n "$default" ]]; then
+        read -rp "$(echo -e ${BLU}${prompt} [${default}]:${RST} )" reply
+        printf -v "$var" '%s' "${reply:-$default}"
+    else
+        read -rp "$(echo -e ${BLU}${prompt}:${RST} )" reply
+        printf -v "$var" '%s' "$reply"
+    fi
+}
+
+ask_password() {
+    local prompt="$1"
+    local var="$2"
+    local pass confirm
+    while true; do
+        read -srp "$(echo -e ${BLU}${prompt}:${RST} )" pass; echo
+        read -srp "$(echo -e ${BLU}Confirm password:${RST} )" confirm; echo
+        if [[ "$pass" == "$confirm" ]]; then
+            printf -v "$var" '%s' "$pass"
+            break
+        fi
+        warn "Passwords do not match, try again."
+    done
+}
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+clear
+echo -e "${BLD}"
+cat << 'BANNER'
+   ____                ___  ____
+  / ___|___  _ __ ___|  _ \/ ___|
+ | |   / _ \| '__/ _ \ | | \___ \
+ | |__| (_) | | |  __/ |_| |___) |
+  \____\___/|_|  \___|____/|____/
+
+  Minimal Arch-based  |  X11 + i3  |  Secure Boot + TPM2
+BANNER
+echo -e "${RST}"
+echo ""
+
+# ── Verify live environment ───────────────────────────────────────────────────
+[[ $EUID -eq 0 ]] || die "Installer must run as root."
+ping -c1 -W3 archlinux.org &>/dev/null || die "No internet connection. Connect first with iwctl or plug in ethernet."
+[[ -d /sys/firmware/efi ]] || die "System is not booted in UEFI mode."
+
+# ── Disk selection ────────────────────────────────────────────────────────────
+info "Available disks:"
+echo ""
+lsblk -d -o NAME,SIZE,MODEL --noheadings | grep -v "loop" | while read -r name size model; do
+    echo -e "  ${BLD}/dev/${name}${RST}  ${size}  ${model}"
+done
+echo ""
+
+ask "Target disk (e.g. sda, nvme0n1)" DISK
+DISK="/dev/${DISK}"
+[[ -b "$DISK" ]] || die "Disk $DISK not found."
+
+echo ""
+warn "This will DESTROY all data on ${DISK}."
+confirm "Are you sure you want to continue?" || { echo "Aborted."; exit 0; }
+
+# ── Partition sizes ───────────────────────────────────────────────────────────
+echo ""
+info "Partition configuration"
+ask "Swap size in GB (0 to skip)" SWAP_GB "4"
+echo ""
+
+# ── Hostname ──────────────────────────────────────────────────────────────────
+ask "Hostname" HOSTNAME "coreos"
+
+# ── Locale / timezone ─────────────────────────────────────────────────────────
+ask "Timezone" TIMEZONE "America/Santo_Domingo"
+ask "Locale"   LOCALE   "en_US.UTF-8"
+
+# ── Encryption ────────────────────────────────────────────────────────────────
+echo ""
+LUKS=false
+if confirm "Enable LUKS full disk encryption on root partition?"; then
+    LUKS=true
+    ask_password "LUKS passphrase" LUKS_PASS
+fi
+
+# ── User setup ────────────────────────────────────────────────────────────────
+echo ""
+CREATE_USER=false
+USERNAME=""
+if confirm "Create a regular user account?"; then
+    CREATE_USER=true
+    ask "Username" USERNAME
+    ask_password "Password for ${USERNAME}" USER_PASS
+    GRANT_SUDO=false
+    confirm "Grant sudo privileges to ${USERNAME}?" && GRANT_SUDO=true
+fi
+
+echo ""
+info "Setting root password"
+ask_password "Root password" ROOT_PASS
+
+# ── Mirror setup ──────────────────────────────────────────────────────────────
+echo ""
+info "Ranking mirrors (this may take a moment)..."
+reflector --country "Dominican Republic,United States" \
+          --age 12 --protocol https --sort rate \
+          --save /etc/pacman.d/mirrorlist 2>/dev/null \
+    || reflector --age 12 --protocol https --sort rate \
+                 --save /etc/pacman.d/mirrorlist
+success "Mirrors updated."
+
+# ── Partitioning ──────────────────────────────────────────────────────────────
+echo ""
+info "Partitioning ${DISK}..."
+
+wipefs -af "$DISK" &>/dev/null
+sgdisk --zap-all "$DISK" &>/dev/null
+
+sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
+
+if [[ "$SWAP_GB" -gt 0 ]]; then
+    sgdisk -n 2:0:+${SWAP_GB}G -t 2:8200 -c 2:"swap" "$DISK"
+    sgdisk -n 3:0:0             -t 3:8300 -c 3:"root" "$DISK"
+    PART_EFI="${DISK}1"
+    PART_SWAP="${DISK}2"
+    PART_ROOT="${DISK}3"
+    if [[ "$DISK" == *"nvme"* ]]; then
+        PART_EFI="${DISK}p1"
+        PART_SWAP="${DISK}p2"
+        PART_ROOT="${DISK}p3"
+    fi
+else
+    sgdisk -n 2:0:0 -t 2:8300 -c 2:"root" "$DISK"
+    PART_EFI="${DISK}1"
+    PART_ROOT="${DISK}2"
+    PART_SWAP=""
+    if [[ "$DISK" == *"nvme"* ]]; then
+        PART_EFI="${DISK}p1"
+        PART_ROOT="${DISK}p2"
+    fi
+fi
+
+partprobe "$DISK"
+sleep 1
+success "Partitioning done."
+
+# ── Formatting ────────────────────────────────────────────────────────────────
+info "Formatting partitions..."
+
+mkfs.fat -F32 -n EFI "$PART_EFI" &>/dev/null
+
+if [[ "$SWAP_GB" -gt 0 ]]; then
+    mkswap -L swap "$PART_SWAP" &>/dev/null
+    swapon "$PART_SWAP"
+fi
+
+if $LUKS; then
+    info "Setting up LUKS encryption on root..."
+    echo -n "$LUKS_PASS" | cryptsetup luksFormat \
+        --type luks2 \
+        --cipher aes-xts-plain64 \
+        --key-size 512 \
+        --hash sha512 \
+        --pbkdf argon2id \
+        "$PART_ROOT" -
+    echo -n "$LUKS_PASS" | cryptsetup open "$PART_ROOT" cryptroot -
+    REAL_ROOT="/dev/mapper/cryptroot"
+else
+    REAL_ROOT="$PART_ROOT"
+fi
+
+mkfs.ext4 -L root "$REAL_ROOT" &>/dev/null
+success "Formatting done."
+
+# ── Mounting ──────────────────────────────────────────────────────────────────
+info "Mounting filesystems..."
+mount "$REAL_ROOT" /mnt
+mount --mkdir "$PART_EFI" /mnt/boot
+success "Mounted."
+
+# ── Pacstrap ──────────────────────────────────────────────────────────────────
+mkdir -p /mnt/var/cache/pacman/pkg
+cp /var/cache/pacman/pkg/*.pkg.tar.zst /mnt/var/cache/pacman/pkg/ 2>/dev/null || true
+
+info "Installing base system (this will take a while)..."
+# Note: paru removed — installed post-chroot via makepkg
+pacstrap -K /mnt \
+    base base-devel linux linux-firmware intel-ucode \
+    systemd-ukify sbctl sbsigntools tpm2-tools tpm2-tss \
+    efibootmgr \
+    networkmanager iwd \
+    pipewire pipewire-pulse pipewire-alsa wireplumber \
+    xorg-server xorg-xinit xorg-xrandr \
+    i3-wm i3status i3lock dmenu \
+    alacritty \
+    git curl wget rsync \
+    man-db man-pages \
+    vim nano less \
+    zsh grml-zsh-config \
+    sudo \
+    ttf-dejavu ttf-liberation noto-fonts \
+    xdg-utils xdg-user-dirs \
+    brightnessctl \
+    unzip zip p7zip \
+    htop fastfetch
+
+success "Base system installed."
+
+# ── fstab ─────────────────────────────────────────────────────────────────────
+info "Generating fstab..."
+genfstab -U /mnt >> /mnt/etc/fstab
+# Lock down EFI partition permissions persistently via mount options
+sed -i 's|\(vfat.*defaults\)|\1,umask=0077,fmask=0177,dmask=0077|' /mnt/etc/fstab
+success "fstab done."
+
+# ── Chroot configuration ──────────────────────────────────────────────────────
+info "Configuring system..."
+
+arch-chroot /mnt /bin/bash << CHROOT
+set -euo pipefail
+
+# Timezone
+ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
+hwclock --systohc
+
+# Locale
+sed -i "s/^#${LOCALE}/${LOCALE}/" /etc/locale.gen
+locale-gen
+echo "LANG=${LOCALE}" > /etc/locale.conf
+
+# Hostname
+echo "${HOSTNAME}" > /etc/hostname
+cat > /etc/hosts << HOSTS
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+HOSTS
+
+# mkinitcpio hooks
+if ${LUKS}; then
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+else
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)/' /etc/mkinitcpio.conf
+fi
+mkinitcpio -P
+
+# Root password
+echo "root:${ROOT_PASS}" | chpasswd
+
+# User setup
+if ${CREATE_USER}; then
+    useradd -m -G wheel,audio,video,input -s /bin/zsh ${USERNAME}
+    echo "${USERNAME}:${USER_PASS}" | chpasswd
+    if ${GRANT_SUDO}; then
+        sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+    fi
+fi
+
+# Enable services
+systemctl enable NetworkManager
+systemctl enable iwd
+
+# systemd-boot
+bootctl install
+
+# Boot loader config
+cat > /boot/loader/loader.conf << LOADER
+default coreos.conf
+timeout 5
+console-mode auto
+editor no
+LOADER
+
+# Kernel cmdline
+if ${LUKS}; then
+    LUKS_UUID=\$(blkid -s UUID -o value ${PART_ROOT})
+    CMDLINE="cryptdevice=UUID=\${LUKS_UUID}:cryptroot root=/dev/mapper/cryptroot rw quiet"
+else
+    ROOT_UUID=\$(blkid -s UUID -o value ${REAL_ROOT})
+    CMDLINE="root=UUID=\${ROOT_UUID} rw quiet"
+fi
+
+cat > /boot/loader/entries/coreos.conf << ENTRY
+title   CoreOS
+linux   /vmlinuz-linux
+initrd  /intel-ucode.img
+initrd  /initramfs-linux.img
+options \${CMDLINE}
+ENTRY
+
+# ── Secure Boot — sign during install ────────────────────────────────────────
+sbctl create-keys
+sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi
+sbctl sign -s /boot/vmlinuz-linux
+
+# Lock down /boot — all files written at this point
+find /boot -type d -exec chmod 700 {} \;
+find /boot -type f -exec chmod 600 {} \;
+
+# Pacman hook — re-sign kernel on every update
+mkdir -p /etc/pacman.d/hooks
+cat > /etc/pacman.d/hooks/99-secureboot-sign.hook << HOOK
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+
+[Action]
+Description = Signing kernel for Secure Boot...
+When = PostTransaction
+Exec = /usr/bin/sbctl sign -s /boot/vmlinuz-linux
+HOOK
+
+# ── First boot — Secure Boot enrollment + TPM2 ───────────────────────────────
+cat > /usr/local/bin/coreos-firstboot << 'FIRSTBOOT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG=/var/log/coreos-firstboot.log
+exec > >(tee -a "\$LOG") 2>&1
+
+echo "[coreos-firstboot] Starting first boot setup..."
+
+if sbctl status | grep -q "Setup Mode.*Enabled"; then
+    sbctl enroll-keys --microsoft
+    echo "[coreos-firstboot] Secure Boot keys enrolled."
+else
+    echo "[coreos-firstboot] WARNING: Not in Setup Mode. Run: sbctl enroll-keys --microsoft"
+fi
+
+if [[ -b /dev/tpmrm0 ]]; then
+    LUKS_PART=\$(blkid -t TYPE=crypto_LUKS -o device | head -n1)
+    if [[ -n "\$LUKS_PART" ]]; then
+        systemd-cryptenroll \
+            --tpm2-device=auto \
+            --tpm2-pcrs=7 \
+            "\$LUKS_PART" \
+            && echo "[coreos-firstboot] TPM2 enrollment done." \
+            || echo "[coreos-firstboot] WARNING: TPM2 enrollment failed. Passphrase still works."
+    else
+        echo "[coreos-firstboot] No LUKS partition found, skipping TPM2."
+    fi
+else
+    echo "[coreos-firstboot] No TPM2 device found, skipping TPM2."
+fi
+
+echo "[coreos-firstboot] Done."
+FIRSTBOOT
+chmod 755 /usr/local/bin/coreos-firstboot
+
+cat > /etc/systemd/system/coreos-firstboot.service << FBSERVICE
+[Unit]
+Description=CoreOS first boot — Secure Boot + TPM2 setup
+ConditionPathExists=!/etc/coreos-firstboot-done
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/coreos-firstboot
+ExecStartPost=/usr/bin/touch /etc/coreos-firstboot-done
+RemainAfterExit=yes
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+FBSERVICE
+
+systemctl enable coreos-firstboot.service
+
+# ── First update service ──────────────────────────────────────────────────────
+cat > /etc/systemd/system/coreos-firstupdate.service << FUSERVICE
+[Unit]
+Description=CoreOS first boot system update
+ConditionPathExists=!/etc/coreos-firstupdate-done
+After=network-online.target coreos-firstboot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pacman -Syu --noconfirm
+ExecStartPost=/usr/bin/touch /etc/coreos-firstupdate-done
+RemainAfterExit=yes
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+FUSERVICE
+
+systemctl enable coreos-firstupdate.service
+
+# ── Paru (AUR helper) ─────────────────────────────────────────────────────────
+# Install paru-bin from AUR — pre-compiled binary, no Rust needed
+# Uses a temp build user to satisfy makepkg's no-root requirement
+info_msg() { echo -e "\033[0;34m\033[1m==> \033[0m\033[1m\$*\033[0m"; }
+
+info_msg "Installing paru..."
+
+# Create dedicated build user
+useradd -m -r -s /bin/bash builduser 2>/dev/null || true
+echo "builduser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builduser
+
+# Set up build directory with correct ownership
+mkdir -p /opt/paru-build
+chown builduser:builduser /opt/paru-build
+
+# Clone paru-bin (pre-built binary — no Rust compile needed, instant)
+sudo -u builduser git clone https://aur.archlinux.org/paru-bin.git /opt/paru-build/paru-bin
+
+# Build and install
+cd /opt/paru-build/paru-bin
+sudo -u builduser makepkg -si --noconfirm --noprogressbar
+
+# Cleanup build user and temp files
+userdel -r builduser 2>/dev/null || true
+rm -f /etc/sudoers.d/builduser
+rm -rf /opt/paru-build
+
+# If user exists, set paru config
+if ${CREATE_USER}; then
+    mkdir -p /home/${USERNAME}/.config/paru
+    cat > /home/${USERNAME}/.config/paru/paru.conf << 'PARUCONF'
+[options]
+BottomUp
+SudoLoop
+Devel
+CleanAfter
+NewsOnUpgrade
+PARUCONF
+    chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/paru
+fi
+
+echo "Chroot configuration complete."
+CHROOT
+
+success "System configured."
+
+# ── Cleanup + summary ─────────────────────────────────────────────────────────
+umount -R /mnt
+[[ -n "${PART_SWAP:-}" ]] && swapoff "$PART_SWAP" 2>/dev/null || true
+$LUKS && cryptsetup close cryptroot 2>/dev/null || true
+
+echo ""
+echo -e "${GRN}${BLD}════════════════════════════════════════${RST}"
+echo -e "${GRN}${BLD}  CoreOS installation complete!${RST}"
+echo -e "${GRN}${BLD}════════════════════════════════════════${RST}"
+echo ""
+echo -e "  Hostname   : ${BLD}${HOSTNAME}${RST}"
+echo -e "  Disk       : ${BLD}${DISK}${RST}"
+echo -e "  Encryption : ${BLD}$(${LUKS} && echo 'LUKS2' || echo 'none')${RST}"
+echo -e "  Secure Boot: ${BLD}Keys signed. Enroll on first boot.${RST}"
+echo -e "  TPM2       : ${BLD}Will auto-enroll on first boot (if LUKS).${RST}"
+echo ""
+echo -e "  ${YLW}Before rebooting:${RST}"
+echo -e "  1. Enter UEFI firmware and set Secure Boot to ${BLD}Setup Mode${RST}"
+echo -e "  2. Reboot — first boot service enrolls keys automatically"
+echo ""
+echo -e "  ${BLU}${BLD}Remove the installer media and reboot when ready.${RST}"
+echo ""
