@@ -13,3 +13,5 @@ ExecStart=/usr/bin/pacman-key --populate
 
 [Install]
 WantedBy=multi-user.target
+ExecStart=/usr/bin/bash -c 'curl -s https://frank1o3.github.io/CoreOS-repo/coreos-repo.gpg | pacman-key --add -'
+ExecStart=/usr/bin/pacman-key --lsign-key 5128C09E64959EFA

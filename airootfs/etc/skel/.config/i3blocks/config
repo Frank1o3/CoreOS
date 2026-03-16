@@ -1,0 +1,19 @@
+command=echo ""
+separator=true
+separator_block_width=15
+
+[time]
+command=date "+%H:%M"
+interval=60
+
+[cpu]
+command=grep 'cpu ' /proc/stat | awk '{u=$2+$4; t=$2+$4+$5} NR==1{u1=u;t1=t;next}{printf "%d%%", (u-u1)*100/(t-t1)}'
+interval=2
+
+[mem]
+command=free -h | awk '/Mem:/ {print $3 "/" $2}'
+interval=5
+
+[disk]
+command=df -h / | awk 'NR==2 {print $3 "/" $2}'
+interval=30

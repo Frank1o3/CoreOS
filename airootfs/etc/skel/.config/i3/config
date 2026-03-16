@@ -1,0 +1,65 @@
+set $mod Mod4
+font pango:DejaVu Sans 10
+
+# terminal
+set $term alacritty
+
+# launcher
+set $menu dmenu_run
+
+# basic keybinds
+bindsym $mod+Return exec $term
+bindsym $mod+d exec $menu
+bindsym $mod+Shift+e exec "i3-msg exit"
+
+# reload / restart
+bindsym $mod+Shift+c reload
+bindsym $mod+Shift+r restart
+
+# focus
+bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+
+# move windows
+bindsym $mod+Shift+h move left
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
+bindsym $mod+Shift+l move right
+
+# workspace switching
+set $ws1 "1"
+set $ws2 "2"
+set $ws3 "3"
+set $ws4 "4"
+
+bindsym $mod+1 workspace $ws1
+bindsym $mod+2 workspace $ws2
+bindsym $mod+3 workspace $ws3
+bindsym $mod+4 workspace $ws4
+
+# start programs
+exec_always --no-startup-id nm-applet
+exec_always --no-startup-id i3blocks
+
+# borders
+default_border pixel 2
+default_floating_border pixel 2
+
+# colors (pywal compatible fallback)
+set $bg #1d1f21
+set $fg #c5c8c6
+set $accent #81a2be
+
+client.focused          $accent $accent $fg $accent
+client.unfocused        $bg     $bg     $fg $bg
+client.focused_inactive $bg     $bg     $fg $bg
+client.urgent           #cc6666 #cc6666 #ffffff #cc6666
+
+# bar
+bar {
+    status_command i3blocks
+    position top
+    font pango:DejaVu Sans 10
+}
