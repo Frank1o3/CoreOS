@@ -121,12 +121,18 @@ ask_password "Root password" ROOT_PASS
 # ── Mirror ranking ────────────────────────────────────────────────────────────
 echo ""
 info "Ranking mirrors..."
-reflector --country "Dominican Republic,United States" \
+if ! reflector --country "Dominican Republic,United States" \
           --protocol https --age 12 --sort rate \
-          --save /etc/pacman.d/mirrorlist 2>/dev/null \
-    || reflector --protocol https --age 12 --sort rate \
-                 --save /etc/pacman.d/mirrorlist
-success "Mirrors ranked."
+          --save /etc/pacman.d/mirrorlist 2>/dev/null; then
+    warn "reflector failed, using fallback mirrors"
+    cat > /etc/pacman.d/mirrorlist << 'MIRRORS'
+## Fallback mirrors — reflector was unavailable or failed
+Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+Server = https://mirror.math.princeton.edu/pub/archlinux/$repo/os/$arch
+MIRRORS
+fi
+success "Mirrors configured."
 
 # ── Partitioning ──────────────────────────────────────────────────────────────
 echo ""
@@ -216,16 +222,17 @@ info "Installing base system (this will take a while)..."
 pacstrap -K /mnt --needed \
     base base-devel linux linux-firmware intel-ucode \
     systemd-ukify sbctl sbsigntools tpm2-tools tpm2-tss efibootmgr \
-    networkmanager iwd \
+    networkmanager networkmanager-applet iwd \
+    bluez bluez-utils \
     pipewire pipewire-pulse pipewire-alsa wireplumber \
     xorg-server xorg-xinit xorg-xrandr \
-    i3-wm i3status i3lock dmenu alacritty \
+    i3-wm i3status i3lock dmenu i3blocks alacritty \
     git curl wget rsync \
     vim nano less \
     sudo zsh grml-zsh-config \
     man-db man-pages \
     ttf-dejavu ttf-liberation noto-fonts \
-    xdg-utils xdg-user-dirs \
+    xdg-utils xdg-user-dirs xdg-desktop-portal xdg-desktop-portal-gtk \
     brightnessctl \
     unzip zip p7zip \
     htop fastfetch
@@ -249,7 +256,7 @@ set -euo pipefail
 # ── Timezone + locale ─────────────────────────────────────────────────────────
 ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
 hwclock --systohc
-sed -i "s/^#${LOCALE}/${LOCALE}/" /etc/locale.gen
+sed -i "s/^# *${LOCALE}/${LOCALE}/" /etc/locale.gen
 locale-gen
 echo "LANG=${LOCALE}" > /etc/locale.conf
 
@@ -271,21 +278,86 @@ else
 fi
 mkinitcpio -P
 
-# ── Users ─────────────────────────────────────────────────────────────────────
+# ── Users ─────────────────────────────────────────────────────────────────
 echo "root:${ROOT_PASS}" | chpasswd
 
+# Helper: write auto-start-X config for a given home directory
+write_x11_autostart() {
+    local home="$1" user="$2"
+    cat > "${home}/.xinitrc" << 'XINITRC'
+#!/bin/sh
+# Load X resources if available
+[[ -f ~/.Xresources ]] && xrdb -merge ~/.Xresources
+# Load pywal colors if available
+[[ -f ~/.cache/wal/colors.sh ]] && source ~/.cache/wal/colors.sh
+# Start i3
+exec i3
+XINITRC
+    chmod +x "${home}/.xinitrc"
+
+    cat > "${home}/.zlogin" << 'ZLOGIN'
+# Auto-start X on tty1
+if [[ -z "$DISPLAY" ]] && [[ "$(tty)" == "/dev/tty1" ]]; then
+    exec startx > ~/.xorg.log 2>&1 || {
+        echo ""
+        echo "WARNING: startx failed. Check ~/.xorg.log for details."
+        echo "Dropping to shell. Run 'startx' manually to retry."
+    }
+fi
+ZLOGIN
+    chown "${user}:${user}" "${home}/.xinitrc"
+    chown "${user}:${user}" "${home}/.zlogin"
+}
+
+# Update skel for future users
+cat > /etc/skel/.xinitrc << 'XINITRC'
+#!/bin/sh
+[[ -f ~/.Xresources ]] && xrdb -merge ~/.Xresources
+[[ -f ~/.cache/wal/colors.sh ]] && source ~/.cache/wal/colors.sh
+exec i3
+XINITRC
+chmod +x /etc/skel/.xinitrc
+
+cat > /etc/skel/.zlogin << 'SKELZLOGIN'
+# Auto-start X on tty1
+if [[ -z "$DISPLAY" ]] && [[ "$(tty)" == "/dev/tty1" ]]; then
+    exec startx > ~/.xorg.log 2>&1 || {
+        echo ""
+        echo "WARNING: startx failed. Check ~/.xorg.log for details."
+        echo "Dropping to shell. Run 'startx' manually to retry."
+    }
+fi
+SKELZLOGIN
+
 if ${CREATE_USER}; then
+    # Create user (skel files auto-copied by -m flag)
     useradd -m -G wheel,audio,video,input -s /bin/zsh ${USERNAME}
     echo "${USERNAME}:${USER_PASS}" | chpasswd
     if ${GRANT_SUDO}; then
         sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' \
             /etc/sudoers
     fi
+
+    # Replace .zlogin/.xinitrc with proper X11 auto-start (overwrites skel copy)
+    write_x11_autostart "/home/${USERNAME}" "${USERNAME}"
+
+    # Auto-login the created user on tty1
+    mkdir -p /etc/systemd/system/getty@tty1.service.d/
+    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << AUTOLOGIN
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin ${USERNAME} - \\\$TERM
+AUTOLOGIN
+else
+    # No user created — set up root for auto-start X so the system is still usable
+    warn "No regular user created. Root will auto-start X on tty1."
+    write_x11_autostart "/root" "root"
 fi
 
-# ── Services ──────────────────────────────────────────────────────────────────
+# ── Services ──────────────────────────────────────────────────────────────
 systemctl enable NetworkManager
 systemctl enable iwd
+systemctl enable bluetooth
 
 # ── systemd-boot ──────────────────────────────────────────────────────────────
 bootctl install
@@ -318,12 +390,14 @@ ENTRY
 sbctl create-keys
 sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi
 sbctl sign -s /boot/vmlinuz-linux
+sbctl sign -s /boot/intel-ucode.img
+sbctl sign -s /boot/initramfs-linux.img
 
 # Lock down /boot permissions
 find /boot -type d -exec chmod 700 {} \;
 find /boot -type f -exec chmod 600 {} \;
 
-# Pacman hook — re-sign kernel on every update
+# Pacman hook — re-sign kernel + initrd on every update
 mkdir -p /etc/pacman.d/hooks
 cat > /etc/pacman.d/hooks/99-secureboot-sign.hook << HOOK
 [Trigger]
@@ -333,9 +407,9 @@ Type = Package
 Target = linux
 
 [Action]
-Description = Signing kernel for Secure Boot...
+Description = Signing kernel + initrd for Secure Boot...
 When = PostTransaction
-Exec = /usr/bin/sbctl sign -s /boot/vmlinuz-linux
+Exec = /usr/bin/sh -c 'sbctl sign -s /boot/vmlinuz-linux && sbctl sign -s /boot/initramfs-linux.img && sbctl sign -s /boot/intel-ucode.img'
 HOOK
 
 # ── CoreOS repo ───────────────────────────────────────────────────────────────
@@ -391,7 +465,8 @@ cat > /etc/systemd/system/coreos-firstboot.service << FBSERVICE
 [Unit]
 Description=CoreOS first boot — Secure Boot + TPM2
 ConditionPathExists=!/etc/coreos-firstboot-done
-After=multi-user.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -412,20 +487,45 @@ cat > /usr/local/bin/coreos-firstupdate << 'FIRSTUPDATE'
 set -euo pipefail
 
 LOG=/var/log/coreos-firstupdate.log
-exec > >(tee -a "\$LOG") 2>&1
+exec > >(tee -a "$LOG") 2>&1
+
+COREOS_KEY="5128C09E64959EFA"
+KEYSERVER_URL="https://frank1o3.github.io/CoreOS-repo/coreos-repo.gpg"
 
 echo "[coreos-firstupdate] Syncing package databases..."
 pacman -Sy --noconfirm
 
 echo "[coreos-firstupdate] Bootstrapping CoreOS keyring..."
-# Temp import — just enough to install the keyring package
-curl -s https://frank1o3.github.io/CoreOS-repo/coreos-repo.gpg \
-    | pacman-key --add -
-pacman-key --lsign-key 5128C09E64959EFA
+# Wait for pacman-init to finish if still running
+for i in $(seq 1 30); do
+    if systemctl --quiet is-active pacman-init.service 2>/dev/null; then
+        sleep 2
+    else
+        break
+    fi
+done
+
+# Import key with error handling
+if ! curl -sf "$KEYSERVER_URL" | pacman-key --add -; then
+    echo "[coreos-firstupdate] ERROR: Failed to download/import CoreOS GPG key."
+    echo "[coreos-firstupdate] Check your internet connection and key server URL."
+    echo "[coreos-firstupdate] Manual recovery: curl -s $KEYSERVER_URL | pacman-key --add -"
+    exit 1
+fi
+
+if ! pacman-key --lsign-key "$COREOS_KEY" 2>/dev/null; then
+    echo "[coreos-firstupdate] ERROR: Failed to locally sign CoreOS GPG key ($COREOS_KEY)."
+    echo "[coreos-firstupdate] The key may have expired or be invalid."
+    echo "[coreos-firstupdate] Manual recovery: pacman-key --lsign-key $COREOS_KEY"
+    exit 1
+fi
 
 # Install keyring — key is now permanently managed by pacman
-pacman -S --noconfirm coreos/coreos-keyring
-pacman-key --populate coreos
+if ! pacman -S --noconfirm coreos/coreos-keyring; then
+    echo "[coreos-firstupdate] ERROR: Failed to install coreos-keyring package."
+    exit 1
+fi
+pacman-key --populate coreos 2>/dev/null || true
 
 # Upgrade SigLevel now that keyring is installed
 sed -i '/\[coreos\]/{n;s/SigLevel = Optional TrustAll/SigLevel = Required DatabaseOptional/}' \

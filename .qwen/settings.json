@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find *)",
+      "Bash(file *)",
+      "Bash(which *)",
+      "Bash(mkarchiso *)"
+    ]
+  },
+  "$version": 3
+}

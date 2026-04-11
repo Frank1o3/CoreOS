@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Apply CoreOS theme configuration to the current user's home directory
+set -euo pipefail
+
+THEME_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEST="${HOME}/.config"
+
+echo "Applying CoreOS theme..."
+
+# i3wm config
+if [[ -d "${THEME_DIR}/templates/i3" ]]; then
+    mkdir -p "${DEST}/i3"
+    cp -r "${THEME_DIR}/templates/i3/"* "${DEST}/i3/"
+    echo "  ✓ i3 config applied"
+fi
+
+# i3blocks config
+if [[ -d "${THEME_DIR}/templates/i3blocks" ]]; then
+    mkdir -p "${DEST}/i3blocks"
+    cp -r "${THEME_DIR}/templates/i3blocks/"* "${DEST}/i3blocks/"
+    echo "  ✓ i3blocks config applied"
+fi
+
+echo "Theme applied to ${DEST}"
+echo "Restart i3 (Mod+Shift+r) to see changes."
