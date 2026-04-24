@@ -27,3 +27,15 @@ parted
 dosfstools
 e2fsprogs
 cryptsetup
+sbctl
+sbsigntools
+tpm2-tools
+tpm2-tss
+efibootmgr
+
+# Utilities
+vim
+nano
+git
+htop
+less

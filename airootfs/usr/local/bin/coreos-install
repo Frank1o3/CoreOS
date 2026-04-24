@@ -5,6 +5,10 @@
 # Partition layout: EFI (512M) + swap (optional) + root (ext4, remainder)
 # =============================================================================
 
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /usr/bin/env bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -23,17 +27,17 @@ die()     { echo -e "${RED}${BLD}ERROR:${RST} $*" >&2; exit 1; }
 
 confirm() {
     local reply
-    read -rp "$(echo -e ${YLW}${1} [y/N]: ${RST})" reply
+    read -rp "$(echo -e "${YLW}${1} [y/N]: ${RST}")" reply
     [[ "${reply,,}" == "y" ]]
 }
 
 ask() {
     local prompt="$1" var="$2" default="${3:-}" reply
     if [[ -n "$default" ]]; then
-        read -rp "$(echo -e ${BLU}${prompt} [${default}]:${RST} )" reply
+        read -rp "$(echo -e "${BLU}${prompt} [${default}]:${RST} ")" reply
         printf -v "$var" '%s' "${reply:-$default}"
     else
-        read -rp "$(echo -e ${BLU}${prompt}:${RST} )" reply
+        read -rp "$(echo -e "${BLU}${prompt}:${RST} ")" reply
         printf -v "$var" '%s' "$reply"
     fi
 }
@@ -41,8 +45,8 @@ ask() {
 ask_password() {
     local prompt="$1" var="$2" pass confirm
     while true; do
-        read -srp "$(echo -e ${BLU}${prompt}:${RST} )" pass; echo
-        read -srp "$(echo -e ${BLU}Confirm password:${RST} )" confirm; echo
+        read -srp "$(echo -e "${BLU}${prompt}:${RST} ")" pass; echo
+        read -srp "$(echo -e "${BLU}Confirm password:${RST} ")" confirm; echo
         [[ "$pass" == "$confirm" ]] && break
         warn "Passwords do not match, try again."
     done
@@ -121,7 +125,7 @@ ask_password "Root password" ROOT_PASS
 # ── Mirror ranking ────────────────────────────────────────────────────────────
 echo ""
 info "Ranking mirrors..."
-if ! reflector --country "Dominican Republic,United States" \
+if ! reflector --country 'Dominican Republic,United States' \
           --protocol https --age 12 --sort rate \
           --save /etc/pacman.d/mirrorlist 2>/dev/null; then
     warn "reflector failed, using fallback mirrors"
@@ -210,8 +214,48 @@ success "Formatting done."
 # ── Mounting ──────────────────────────────────────────────────────────────────
 info "Mounting filesystems..."
 mount "$REAL_ROOT" /mnt
-mount --mkdir "$PART_EFI" /mnt/boot
+mount -o umask=0077,fmask=0177,dmask=0177 --mkdir "$PART_EFI" /mnt/boot
 success "Mounted."
+
+# ── Hardware Detection ────────────────────────────────────────────────────────
+info "Detecting hardware for optimized package installation..."
+
+# Initialize hardware-specific packages array
+HW_PACKAGES=()
+
+# CPU detection
+if lscpu | grep -qi intel; then
+    HW_PACKAGES+=(intel-ucode)
+    info "Intel CPU detected - adding intel-ucode"
+elif lscpu | grep -qi amd; then
+    HW_PACKAGES+=(amd-ucode)
+    info "AMD CPU detected - adding amd-ucode"
+fi
+
+# GPU detection
+if lspci | grep -qi nvidia; then
+    HW_PACKAGES+=(nvidia-dkms nvidia-utils nvidia-settings)
+    info "NVIDIA GPU detected - adding NVIDIA DKMS drivers (auto-rebuilds on kernel updates)"
+fi
+
+if lspci | grep -qi amd && lspci | grep -qi "radeon\|amdgpu"; then
+    HW_PACKAGES+=(mesa xf86-video-amdgpu)
+    info "AMD GPU detected - adding AMD drivers"
+fi
+
+# Intel iGPU detection (only add if no dedicated GPU or safe to coexist)
+if lspci | grep -qi intel && lspci | grep -qi "integrated graphics\|hd graphics"; then
+    if ! lspci | grep -qi nvidia; then
+        # Safe to add Intel drivers if no NVIDIA
+        HW_PACKAGES+=(mesa xf86-video-intel)
+        info "Intel iGPU detected - adding Intel graphics drivers"
+    else
+        info "Intel iGPU + NVIDIA GPU detected - using NVIDIA drivers only"
+    fi
+fi
+
+# Convert array to space-separated string for pacstrap
+HW_PACKAGES_STR="${HW_PACKAGES[*]}"
 
 # ── Pacstrap ──────────────────────────────────────────────────────────────────
 mkdir -p /mnt/var/cache/pacman/pkg
@@ -219,10 +263,11 @@ cp /var/cache/pacman/pkg/*.pkg.tar.zst \
     /mnt/var/cache/pacman/pkg/ 2>/dev/null || true
 
 info "Installing base system (this will take a while)..."
+# Note: AUR packages (networkmanager-applet) will be installed after paru is bootstrapped
 pacstrap -K /mnt --needed \
-    base base-devel linux linux-firmware intel-ucode \
+    base base-devel linux linux-firmware \
     systemd-ukify sbctl sbsigntools tpm2-tools tpm2-tss efibootmgr \
-    networkmanager networkmanager-applet iwd \
+    networkmanager iwd \
     bluez bluez-utils \
     pipewire pipewire-pulse pipewire-alsa wireplumber \
     xorg-server xorg-xinit xorg-xrandr \
@@ -235,7 +280,9 @@ pacstrap -K /mnt --needed \
     xdg-utils xdg-user-dirs xdg-desktop-portal xdg-desktop-portal-gtk \
     brightnessctl \
     unzip zip p7zip \
-    htop fastfetch
+    htop fastfetch \
+    picom \
+    $HW_PACKAGES_STR
 
 success "Base system installed."
 
@@ -247,10 +294,15 @@ sed -i 's|\(vfat.*defaults\)|\1,umask=0077,fmask=0177,dmask=0077|' \
     /mnt/etc/fstab
 success "fstab done."
 
-# ── Chroot ────────────────────────────────────────────────────────────────────
-info "Configuring system..."
+# ── Chroot: System Basics ────────────────────────────────────────────────────
+info "Configuring system basics (timezone, locale, hostname)..."
 
-arch-chroot /mnt /bin/bash << CHROOT
+arch-chroot /mnt /usr/bin/env \
+    TIMEZONE="${TIMEZONE}" \
+    LOCALE="${LOCALE}" \
+    HOSTNAME="${HOSTNAME}" \
+    LUKS="${LUKS}" \
+    /bin/bash << 'CHROOT_BASICS'
 set -euo pipefail
 
 # ── Timezone + locale ─────────────────────────────────────────────────────────
@@ -277,57 +329,24 @@ else
         /etc/mkinitcpio.conf
 fi
 mkinitcpio -P
+CHROOT_BASICS
+
+success "System basics configured."
+
+# ── Chroot: Users ─────────────────────────────────────────────────────────────
+info "Configuring users and authentication..."
+
+arch-chroot /mnt /usr/bin/env \
+    CREATE_USER="${CREATE_USER}" \
+    USERNAME="${USERNAME}" \
+    USER_PASS="${USER_PASS}" \
+    GRANT_SUDO="${GRANT_SUDO}" \
+    ROOT_PASS="${ROOT_PASS}" \
+    /bin/bash << 'CHROOT_USERS'
+set -euo pipefail
 
 # ── Users ─────────────────────────────────────────────────────────────────
 echo "root:${ROOT_PASS}" | chpasswd
-
-# Helper: write auto-start-X config for a given home directory
-write_x11_autostart() {
-    local home="$1" user="$2"
-    cat > "${home}/.xinitrc" << 'XINITRC'
-#!/bin/sh
-# Load X resources if available
-[[ -f ~/.Xresources ]] && xrdb -merge ~/.Xresources
-# Load pywal colors if available
-[[ -f ~/.cache/wal/colors.sh ]] && source ~/.cache/wal/colors.sh
-# Start i3
-exec i3
-XINITRC
-    chmod +x "${home}/.xinitrc"
-
-    cat > "${home}/.zlogin" << 'ZLOGIN'
-# Auto-start X on tty1
-if [[ -z "$DISPLAY" ]] && [[ "$(tty)" == "/dev/tty1" ]]; then
-    exec startx > ~/.xorg.log 2>&1 || {
-        echo ""
-        echo "WARNING: startx failed. Check ~/.xorg.log for details."
-        echo "Dropping to shell. Run 'startx' manually to retry."
-    }
-fi
-ZLOGIN
-    chown "${user}:${user}" "${home}/.xinitrc"
-    chown "${user}:${user}" "${home}/.zlogin"
-}
-
-# Update skel for future users
-cat > /etc/skel/.xinitrc << 'XINITRC'
-#!/bin/sh
-[[ -f ~/.Xresources ]] && xrdb -merge ~/.Xresources
-[[ -f ~/.cache/wal/colors.sh ]] && source ~/.cache/wal/colors.sh
-exec i3
-XINITRC
-chmod +x /etc/skel/.xinitrc
-
-cat > /etc/skel/.zlogin << 'SKELZLOGIN'
-# Auto-start X on tty1
-if [[ -z "$DISPLAY" ]] && [[ "$(tty)" == "/dev/tty1" ]]; then
-    exec startx > ~/.xorg.log 2>&1 || {
-        echo ""
-        echo "WARNING: startx failed. Check ~/.xorg.log for details."
-        echo "Dropping to shell. Run 'startx' manually to retry."
-    }
-fi
-SKELZLOGIN
 
 if ${CREATE_USER}; then
     # Create user (skel files auto-copied by -m flag)
@@ -337,27 +356,20 @@ if ${CREATE_USER}; then
         sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' \
             /etc/sudoers
     fi
-
-    # Replace .zlogin/.xinitrc with proper X11 auto-start (overwrites skel copy)
-    write_x11_autostart "/home/${USERNAME}" "${USERNAME}"
-
-    # Auto-login the created user on tty1
-    mkdir -p /etc/systemd/system/getty@tty1.service.d/
-    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << AUTOLOGIN
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin ${USERNAME} - \\\$TERM
-AUTOLOGIN
-else
-    # No user created — set up root for auto-start X so the system is still usable
-    warn "No regular user created. Root will auto-start X on tty1."
-    write_x11_autostart "/root" "root"
 fi
+CHROOT_USERS
 
-# ── Services ──────────────────────────────────────────────────────────────
-systemctl enable NetworkManager
-systemctl enable iwd
-systemctl enable bluetooth
+success "Users configured."
+
+# ── Chroot: Bootloader ────────────────────────────────────────────────────────
+info "Configuring bootloader and Secure Boot..."
+
+arch-chroot /mnt /usr/bin/env \
+    LUKS="${LUKS}" \
+    PART_ROOT="${PART_ROOT}" \
+    REAL_ROOT="${REAL_ROOT}" \
+    /bin/bash << 'CHROOT_BOOT'
+set -euo pipefail
 
 # ── systemd-boot ──────────────────────────────────────────────────────────────
 bootctl install
@@ -371,11 +383,11 @@ LOADER
 
 # Build kernel cmdline — LUKS needs cryptdevice, not just root UUID
 if ${LUKS}; then
-    LUKS_UUID=\$(blkid -s UUID -o value ${PART_ROOT})
-    CMDLINE="cryptdevice=UUID=\${LUKS_UUID}:cryptroot root=/dev/mapper/cryptroot rw quiet"
+    LUKS_UUID=$(blkid -s UUID -o value ${PART_ROOT})
+    CMDLINE="cryptdevice=UUID=${LUKS_UUID}:cryptroot root=/dev/mapper/cryptroot rw quiet"
 else
-    ROOT_UUID=\$(blkid -s UUID -o value ${REAL_ROOT})
-    CMDLINE="root=UUID=\${ROOT_UUID} rw quiet"
+    ROOT_UUID=$(blkid -s UUID -o value ${REAL_ROOT})
+    CMDLINE="root=UUID=${ROOT_UUID} rw quiet"
 fi
 
 cat > /boot/loader/entries/coreos.conf << ENTRY
@@ -383,34 +395,39 @@ title   CoreOS
 linux   /vmlinuz-linux
 initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options \${CMDLINE}
+options ${CMDLINE}
 ENTRY
 
 # ── Secure Boot ───────────────────────────────────────────────────────────────
+# ── Secure Boot ───────────────────────────────────────────────────────────────
 sbctl create-keys
 sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi
-sbctl sign -s /boot/vmlinuz-linux
-sbctl sign -s /boot/intel-ucode.img
-sbctl sign -s /boot/initramfs-linux.img
+
+# Only sign the kernel if it's an EFISTUB binary (Arch's linux package is)
+if file /boot/vmlinuz-linux | grep -q "PE32+ executable"; then
+    sbctl sign -s /boot/vmlinuz-linux
+fi
+
+# Skip ucode/initrd - they are not EFI binaries
+# They will be loaded by the signed kernel/bootloader
 
 # Lock down /boot permissions
 find /boot -type d -exec chmod 700 {} \;
 find /boot -type f -exec chmod 600 {} \;
+CHROOT_BOOT
 
-# Pacman hook — re-sign kernel + initrd on every update
-mkdir -p /etc/pacman.d/hooks
-cat > /etc/pacman.d/hooks/99-secureboot-sign.hook << HOOK
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Type = Package
-Target = linux
+success "Bootloader configured."
 
-[Action]
-Description = Signing kernel + initrd for Secure Boot...
-When = PostTransaction
-Exec = /usr/bin/sh -c 'sbctl sign -s /boot/vmlinuz-linux && sbctl sign -s /boot/initramfs-linux.img && sbctl sign -s /boot/intel-ucode.img'
-HOOK
+# ── Chroot: Services ──────────────────────────────────────────────────────────
+info "Configuring services..."
+
+arch-chroot /mnt /bin/bash << 'CHROOT_SERVICES'
+set -euo pipefail
+
+# ── Services ──────────────────────────────────────────────────────────────
+systemctl enable NetworkManager
+systemctl enable iwd
+systemctl enable bluetooth
 
 # ── CoreOS repo ───────────────────────────────────────────────────────────────
 # SigLevel Optional for bootstrap — firstupdate upgrades it after keyring installs
@@ -427,7 +444,7 @@ cat > /usr/local/bin/coreos-firstboot << 'FIRSTBOOT'
 set -euo pipefail
 
 LOG=/var/log/coreos-firstboot.log
-exec > >(tee -a "\$LOG") 2>&1
+exec > >(tee -a "$LOG") 2>&1
 
 echo "[coreos-firstboot] Starting..."
 
@@ -442,12 +459,12 @@ fi
 
 # TPM2 — seal LUKS key to PCR 7 (Secure Boot state)
 if [[ -b /dev/tpmrm0 ]]; then
-    LUKS_PART=\$(blkid -t TYPE=crypto_LUKS -o device | head -n1)
-    if [[ -n "\$LUKS_PART" ]]; then
+    LUKS_PART=$(blkid -t TYPE=crypto_LUKS -o device | head -n1)
+    if [[ -n "$LUKS_PART" ]]; then
         systemd-cryptenroll \
             --tpm2-device=auto \
             --tpm2-pcrs=7 \
-            "\$LUKS_PART" \
+            "$LUKS_PART" \
             && echo "[coreos-firstboot] TPM2 enrollment done." \
             || echo "[coreos-firstboot] WARNING: TPM2 failed. Passphrase still works."
     else
@@ -481,7 +498,7 @@ FBSERVICE
 
 systemctl enable coreos-firstboot.service
 
-# ── First update service — repo bootstrap + full system update ────────────────
+# ── First update service — repo bootstrap + full system update ───────────────
 cat > /usr/local/bin/coreos-firstupdate << 'FIRSTUPDATE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -557,28 +574,75 @@ WantedBy=multi-user.target
 FUSERVICE
 
 systemctl enable coreos-firstupdate.service
+CHROOT_SERVICES
 
-# ── Paru ──────────────────────────────────────────────────────────────────────
-echo "[paru] Installing paru-bin..."
+success "Services configured."
 
-useradd -m -r -s /bin/bash builduser 2>/dev/null || true
-echo "builduser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builduser
-mkdir -p /opt/paru-build
-chown builduser:builduser /opt/paru-build
+# ── Chroot: Environment ───────────────────────────────────────────────────────
+info "Configuring desktop environment and sessions..."
 
-sudo -u builduser git clone \
-    https://aur.archlinux.org/paru-bin.git \
-    /opt/paru-build/paru-bin
+arch-chroot /mnt /usr/bin/env \
+    CREATE_USER="${CREATE_USER}" \
+    USERNAME="${USERNAME}" \
+    /bin/bash << 'CHROOT_ENV'
+set -euo pipefail
 
-cd /opt/paru-build/paru-bin
-sudo -u builduser makepkg -si --noconfirm --noprogressbar
+# Ensure skel configs are executable
+chmod +x /etc/skel/.xinitrc 2>/dev/null || true
 
-userdel -r builduser 2>/dev/null || true
-rm -f /etc/sudoers.d/builduser
-rm -rf /opt/paru-build
-
-# Paru config for regular user
 if ${CREATE_USER}; then
+    # Auto-login the created user on tty1
+    mkdir -p /etc/systemd/system/getty@tty1.service.d/
+    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << AUTOLOGIN
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin ${USERNAME} - \\\$TERM
+AUTOLOGIN
+
+    # Copy skel configs to user home (useradd -m already copied basics, but we ensure .config/)
+    cp -a /etc/skel/.xinitrc /etc/skel/.zlogin /home/${USERNAME}/ 2>/dev/null || true
+    [[ -d /etc/skel/.config ]] && cp -a /etc/skel/.config /home/${USERNAME}/ 2>/dev/null || true
+    chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.xinitrc /home/${USERNAME}/.zlogin /home/${USERNAME}/.config 2>/dev/null || true
+else
+    # No user created — set up root with skel configs so system is still usable
+    echo "WARNING: No regular user created. Root will use skel configs for auto-start X."
+    cp -a /etc/skel/.xinitrc /etc/skel/.zlogin /root/ 2>/dev/null || true
+    [[ -d /etc/skel/.config ]] && cp -a /etc/skel/.config /root/ 2>/dev/null || true
+fi
+CHROOT_ENV
+
+success "Desktop environment configured."
+
+# ── AUR Packages ──────────────────────────────────────────────────────────────
+if [[ "${CREATE_USER}" == "true" ]]; then
+    info "Installing AUR packages..."
+
+    # ── Paru ──────────────────────────────────────────────────────────────────────
+    echo "[paru] Installing paru-bin..."
+
+    useradd -m -r -s /bin/bash builduser 2>/dev/null || true
+    echo "builduser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builduser
+    mkdir -p /opt/paru-build
+    chown builduser:builduser /opt/paru-build
+
+    sudo -u builduser git clone \
+        https://aur.archlinux.org/paru-bin.git \
+        /opt/paru-build/paru-bin
+
+    cd /opt/paru-build/paru-bin
+    sudo -u builduser makepkg -si --noconfirm --noprogressbar
+
+    userdel -r builduser 2>/dev/null || true
+    rm -f /etc/sudoers.d/builduser
+    rm -rf /opt/paru-build
+
+    # AUR packages
+    arch-chroot /mnt /usr/bin/env \
+        USERNAME="${USERNAME}" \
+        /bin/bash << 'CHROOT_AUR'
+    set -euo pipefail
+
+    # Paru config for regular user
     mkdir -p /home/${USERNAME}/.config/paru
     cat > /home/${USERNAME}/.config/paru/paru.conf << 'PARUCONF'
 [options]
@@ -589,12 +653,16 @@ CleanAfter
 NewsOnUpgrade
 PARUCONF
     chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config/paru
+
+    # Install AUR packages
+    echo "[aur] Installing AUR packages via paru..."
+    sudo -u ${USERNAME} paru -S --noconfirm \
+        networkmanager-applet
+    echo "[aur] AUR packages installed."
+CHROOT_AUR
+
+    success "AUR packages installed."
 fi
-
-echo "Chroot configuration complete."
-CHROOT
-
-success "System configured."
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 umount -R /mnt

@@ -19,5 +19,6 @@ file_permissions=(
   ["/root/.automated_script.sh"]="0:0:755"
   ["/root/.gnupg"]="0:0:700"
   ["/usr/local/bin/coreos-install"]="0:0:755"
+  ["/usr/local/bin/coreos-network-setup"]="0:0:755"
   ["/root/customize_airootfs.sh"]="0:0:755"
 )

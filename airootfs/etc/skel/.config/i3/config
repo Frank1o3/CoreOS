@@ -42,6 +42,7 @@ bindsym $mod+4 workspace $ws4
 # start programs
 exec_always --no-startup-id nm-applet
 exec_always --no-startup-id i3blocks
+exec --no-startup-id picom
 
 # borders
 default_border pixel 2

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# =============================================================================
+# CoreOS Network Setup — TUI tool to establish internet connectivity
+# Run this before coreos-install if you lack network access
+# =============================================================================
+
+set -euo pipefail
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[0;33m'
+BLU='\033[0;34m'
+BLD='\033[1m'
+RST='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+info()    { echo -e "${BLU}${BLD}==> ${RST}${BLD}$*${RST}"; }
+success() { echo -e "${GRN}${BLD}==> ${RST}${BLD}$*${RST}"; }
+warn()    { echo -e "${YLW}${BLD}WARNING:${RST} $*"; }
+die()     { echo -e "${RED}${BLD}ERROR:${RST} $*" >&2; exit 1; }
+
+confirm() {
+    local reply
+    read -rp "$(echo -e ${YLW}${1} [y/N]: ${RST})" reply
+    [[ "${reply,,}" == "y" ]]
+}
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+clear
+echo -e "${BLD}"
+cat << 'BANNER'
+ ╔──────────────────────────────────────────────────────╗
+ ║   CoreOS Network Setup                               ║
+ ║   Establish internet connectivity before install     ║
+ ╚──────────────────────────────────────────────────────╝
+BANNER
+echo -e "${RST}"
+echo ""
+
+# ── Check if already connected ────────────────────────────────────────────────
+if ping -c1 -W3 archlinux.org &>/dev/null; then
+    success "Internet connection already active."
+    exit 0
+fi
+
+warn "No internet connection detected."
+echo ""
+
+# ── Network interface selection ───────────────────────────────────────────────
+info "Available network interfaces:"
+echo ""
+ip link show | grep -E '^\d+:' | awk -F': ' '{print $2}' | grep -v lo | while read iface; do
+    state=$(ip link show "$iface" | grep -oP 'state \K\w+' || echo "unknown")
+    echo -e "  ${BLD}${iface}${RST}  (${state})"
+done
+echo ""
+
+read -rp "$(echo -e ${BLU}Enter interface name:${RST} )" IFACE
+[[ -n "$IFACE" ]] || die "No interface specified."
+
+# ── Connection method ─────────────────────────────────────────────────────────
+echo ""
+echo -e "${BLD}Connection method:${RST}"
+echo "  [1] DHCP (automatic, most common)"
+echo "  [2] Static IP (manual configuration)"
+echo ""
+read -rp "$(echo -e ${BLU}Choose [1-2]:${RST} )" method
+
+case "$method" in
+    1)
+        info "Requesting DHCP lease on ${IFACE}..."
+        if ! systemctl start systemd-networkd systemd-resolved 2>/dev/null; then
+            warn "systemd-networkd not available in live environment."
+            die "Please ensure systemd-networkd is running or use static IP."
+        fi
+        dhcpcd "$IFACE" 2>/dev/null || {
+            warn "dhcpcd not available; attempting ip command..."
+            ip link set "$IFACE" up
+            die "Unable to configure DHCP. Try static IP or check interface."
+        }
+        success "DHCP configured on ${IFACE}."
+        ;;
+    2)
+        echo ""
+        read -rp "$(echo -e ${BLU}IP address CIDR e.g. 192.168.1.100/24:${RST} )" IP
+        read -rp "$(echo -e ${BLU}Gateway e.g. 192.168.1.1:${RST} )" GW
+        read -rp "$(echo -e ${BLU}DNS server e.g. 1.1.1.1:${RST} )" DNS
+
+        info "Configuring static IP on ${IFACE}..."
+        ip link set "$IFACE" up
+        ip addr add "$IP" dev "$IFACE" 2>/dev/null || die "Failed to set IP address."
+        ip route add default via "$GW" dev "$IFACE" 2>/dev/null || die "Failed to set gateway."
+        echo "nameserver $DNS" | tee /etc/resolv.conf > /dev/null 2>&1
+        success "Static IP configured on ${IFACE}."
+        ;;
+    *)
+        die "Invalid method."
+        ;;
+esac
+
+# ── Verify connection ─────────────────────────────────────────────────────────
+echo ""
+info "Testing internet connection..."
+sleep 2
+
+if ping -c1 -W3 archlinux.org &>/dev/null; then
+    success "Internet connection established!"
+    echo ""
+    echo "You can now run: /usr/local/bin/coreos-install"
+    echo ""
+else
+    die "No internet connection. Check your configuration and try again."
+fi
